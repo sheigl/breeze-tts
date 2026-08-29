@@ -39,8 +39,8 @@ Breeze TTS 2 is an open-weight text-to-speech model built for real-time interact
 
 ### Requirements
 
-- Linux and Python 3.10 or newer
-- A CUDA-capable NVIDIA GPU
+- Linux and Python 3.12 or newer
+- A CUDA-capable NVIDIA GPU or an Intel XPU (e.g. Arc B-series) with the Intel PyTorch XPU build of `torch`
 - GPU memory: approximately 7.7 GiB for eager inference or 14.4 GiB with `--fast-all`; use a 12 GB GPU for eager or a 24 GB GPU for the fast path
 - The Breeze TTS 2 checkpoint
 
@@ -60,6 +60,27 @@ python -m pip install -r requirements.txt
 ```
 
 All required model components are included in the Breeze TTS 2 checkpoint.
+
+Alternatively, manage the environment with [uv](https://docs.astral.sh/uv/) (recommended for XPU):
+
+```bash
+uv sync --extra dev
+```
+
+This installs `torch` and `torchaudio` from the Intel PyTorch XPU wheel index automatically. Run inference:
+
+```bash
+uv run python infer.py ../breeze-tts-2 \
+  --text "(sigh) It is good to hear your voice again." \
+  --output outputs/voice_en.wav
+```
+
+Run the tests and linter:
+
+```bash
+uv run pytest
+uv run ruff check .
+```
 
 For the tested CUDA environment, build the included Docker image:
 

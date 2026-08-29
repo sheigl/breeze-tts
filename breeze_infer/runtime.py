@@ -26,6 +26,9 @@ def resolve_device(explicit_device: str | None = None) -> str:
     _, _, local_rank = get_dist_info()
     if torch.cuda.is_available():
         return f"cuda:{local_rank}"
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        return f"xpu:{local_rank}"
     return "cpu"
 
 
@@ -35,6 +38,9 @@ def set_all_seeds(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        xpu.manual_seed_all(seed)
 
 
 def update_generation_config_for_breeze(
@@ -82,6 +88,20 @@ def load_runtime(
                 f"device={device} rank={rank} world_size={world_size} local_rank={local_rank} "
                 f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} "
                 f"device_count={torch.cuda.device_count()}"
+            ) from exc
+    elif device.startswith("xpu"):
+        xpu = getattr(torch, "xpu", None)
+        if xpu is None:
+            raise RuntimeError(f"torch.xpu backend unavailable but device={device} requested")
+        try:
+            xpu.set_device(device)
+        except Exception as exc:
+            rank, world_size, local_rank = get_dist_info()
+            raise RuntimeError(
+                "Failed to set XPU device "
+                f"device={device} rank={rank} world_size={world_size} local_rank={local_rank} "
+                f"XPU_VISIBLE_DEVICES={os.environ.get('XPU_VISIBLE_DEVICES')} "
+                f"device_count={xpu.device_count()}"
             ) from exc
     tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
     model = BreezeForConditionalGeneration.from_pretrained(

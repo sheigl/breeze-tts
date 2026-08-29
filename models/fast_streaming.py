@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from collections.abc import Iterator
@@ -16,6 +17,8 @@ from .cudagraph.backbone_prefill_graph import BackbonePrefillGraphCache
 from .cudagraph.depth_decoder_graph import DepthDecoderGraph
 from .cudagraph.sampling import sample_logits
 from .warmup_profile import FastStreamingWarmupProfile
+
+_log = logging.getLogger(__name__)
 
 FastCfgMode = Literal["no_cfg", "single_cfg"]
 
@@ -190,7 +193,19 @@ class FastBreezeStreamingRuntime:
         )
 
         if self.device.type != "cuda":
-            raise RuntimeError("fast streaming requires a CUDA device")
+            _log.warning(
+                "fast streaming requires a CUDA device, but detected %s; disabling all fast "
+                "stages (graph capture / torch.compile are CUDA-only) and falling back to eager "
+                "inference",
+                self.device.type,
+            )
+            self._fast_text_encoder = False
+            self._fast_backbone_prefill = False
+            self._fast_backbone_decode = False
+            self._fast_depth_decoder = False
+            self._fast_codec = False
+            self.model._fast_text_encoder_cudagraph = False
+
         if self.config.repetition_penalty <= 0:
             raise ValueError("repetition_penalty must be > 0")
 
@@ -771,7 +786,7 @@ class FastBreezeStreamingRuntime:
         t_chunk = t_start
         prefill_start_event = None
         prefill_end_event = None
-        if self.config.collect_timing:
+        if self.config.collect_timing and self.device.type == "cuda":
             prefill_start_event = torch.cuda.Event(enable_timing=True)
             prefill_end_event = torch.cuda.Event(enable_timing=True)
             prefill_start_event.record()

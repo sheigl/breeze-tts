@@ -974,6 +974,16 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
             )
             if text_encoder_attn_implementation is None:
                 text_encoder_attn_implementation = "flash_attention_2"
+            if text_encoder_attn_implementation.startswith("flash_attention"):
+                from transformers.utils import is_flash_attn_2_available
+
+                if not is_flash_attn_2_available():
+                    logger.warning(
+                        "text encoder requested %s but flash-attn is unavailable (common on "
+                        "XPU/CPU); falling back to sdpa",
+                        text_encoder_attn_implementation,
+                    )
+                    text_encoder_attn_implementation = "sdpa"
             config.text_encoder_config._attn_implementation = (
                 text_encoder_attn_implementation
             )

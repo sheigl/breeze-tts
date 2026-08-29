@@ -55,6 +55,12 @@ def main() -> None:
     parser.add_argument(
         "--fast-codec", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to run on (e.g. xpu:0, cuda:0, cpu). Defaults to auto-resolution.",
+    )
     args = parser.parse_args()
 
     if not math.isfinite(args.cfg_scale) or args.cfg_scale <= 0:
@@ -69,7 +75,7 @@ def main() -> None:
 
     tokenizer, model, audio_tokenizer = load_runtime(
         args.model,
-        device=resolve_device(),
+        device=args.device if args.device is not None else resolve_device(),
         attn_implementation="eager",
     )
     update_generation_config_for_breeze(model)
