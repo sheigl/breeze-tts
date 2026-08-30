@@ -45,6 +45,7 @@ class BackboneGraph:
         guidance_scale=3.0,
         debug: bool = False,
         batch_size: int = 1,
+        compile: bool = False,
     ):
         self.device = device
         self.dtype = dtype
@@ -52,6 +53,8 @@ class BackboneGraph:
         self.no_graph = (
             False  # runtime flag: True = skip graph replay (for layer-diff hooks)
         )
+        self._compile = bool(compile)
+        self._compiled_decode = None
         self.max_seq_len = max_seq_len
         self.hidden_size = config.hidden_size
         self.num_layers = config.num_hidden_layers
@@ -174,6 +177,8 @@ class BackboneGraph:
         self.no_graph = True
         self._init_cache_layers()
         self._build_initial_attention_mask()
+        if self._compile and str(self.device).startswith("xpu"):
+            self._compiled_decode = self._build_compiled_decode()
         self.captured = False
         return self
 
@@ -284,6 +289,44 @@ class BackboneGraph:
             cfg_result = self.logits_buf[: self.half]
         self.cfg_logits_buf.copy_(cfg_result)
 
+    def _build_compiled_decode(self):
+        """Build a torch.compile()-wrapped pure decode step for devices that
+        cannot capture CUDA graphs (Intel XPU). CUDA keeps graph capture, which
+        is faster than torch.compile, so this is only used when graphs are off.
+
+        Returns (hidden [B,1,H], cfg_logits [half, vocab]) as fresh tensors.
+        """
+        bg = self
+        model = self.model
+        embed = self.embed_tokens
+        lm_head = self.lm_head
+        gs = self.guidance_scale
+
+        @torch.compile
+        def decode(input_ids, attn_mask, position_ids, cache_position):
+            inputs_embeds = embed(input_ids)
+            out = model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attn_mask,
+                past_key_values=bg.static_cache,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                use_cache=True,
+            )
+            hidden = out.last_hidden_state
+            logits = lm_head(hidden[:, -1, :].float())
+            b = logits.shape[0]
+            if b >= 2:
+                half_b = b // 2
+                cond = logits[:half_b]
+                uncond = logits[half_b:]
+                cfg = uncond + gs * (cond - uncond)
+            else:
+                cfg = logits[:1]
+            return hidden, cfg
+
+        return decode
+
     @torch.inference_mode()
     def capture(self, prefill_len=100, num_warmup=3):
         """Capture CUDA graph for single-token decode."""
@@ -387,6 +430,13 @@ class BackboneGraph:
         self.cache_position[0] = self._prefill_len + step_idx
         self._set_attention_mask(self.cache_position[0].item())
         if self.no_graph:
+            if self._compiled_decode is not None:
+                return self._compiled_decode(
+                    self.input_ids_buf,
+                    self.attn_mask,
+                    self.position_ids,
+                    self.cache_position,
+                )
             self._decode_step()
         else:
             self.graph.replay()

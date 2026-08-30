@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import tempfile
 import threading
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -43,10 +44,14 @@ class ApiSettings:
     fast_backbone_decode: bool
     fast_depth_decoder: bool
     fast_codec: bool
+    compile_xpu: bool
 
 
 _settings: ApiSettings | None = None
 _request_lock = threading.Lock()
+# FIFO-fair lock that serializes inference requests (one at a time) on the
+# single XPU/CUDA card. Requests wait their turn instead of failing with 409.
+_gpu_lock = asyncio.Lock()
 
 
 def _pcm16(audio: np.ndarray) -> bytes:
@@ -89,6 +94,7 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
         fast_backbone_decode=settings.fast_backbone_decode,
         fast_depth_decoder=settings.fast_depth_decoder,
         fast_codec=settings.fast_codec,
+        compile_xpu=settings.compile_xpu,
         repetition_penalty=REPETITION_PENALTY,
     )
     runtime = FastBreezeStreamingRuntime(
@@ -133,11 +139,6 @@ async def speech(
     ref_text: str = Form(""),
     seed: int = Form(42),
 ) -> StreamingResponse:
-    if not _request_lock.acquire(blocking=False):
-        raise HTTPException(
-            status_code=409, detail="An inference request is already running."
-        )
-
     reference_path: Path | None = None
     try:
         if not np.isfinite(cfg_scale) or cfg_scale <= 0:
@@ -156,7 +157,7 @@ async def speech(
             reference_path = await _save_upload(ref_audio)
 
         request_id = f"api-{uuid.uuid4().hex}"
-        request = {
+        request_payload = {
             "id": request_id,
             "text": text,
             "instruction": instruction,
@@ -164,8 +165,8 @@ async def speech(
         }
         template_name = "tts_instruction"
         if reference_path is not None:
-            request["ref_audio_path"] = str(reference_path)
-            request["ref_text"] = ref_text
+            request_payload["ref_audio_path"] = str(reference_path)
+            request_payload["ref_text"] = ref_text
             template_name = "ref_edit_tata"
 
         set_all_seeds(seed)
@@ -173,30 +174,68 @@ async def speech(
             app.state.tokenizer,
             app.state.audio_tokenizer,
             app.state.model,
-            [request],
+            [request_payload],
             get_template(template_name),
             guidance_scale=cfg_scale,
             guidance_scale_ref=None,
             guidance_scale_ins=None,
         )
+    except HTTPException:
+        if reference_path is not None:
+            reference_path.unlink(missing_ok=True)
+        raise
     except Exception:
         if reference_path is not None:
             reference_path.unlink(missing_ok=True)
-        _request_lock.release()
         raise
 
-    def body() -> Iterator[bytes]:
+    async def body() -> AsyncIterator[bytes]:
+        # FIFO queue: wait for the GPU slot instead of failing with 409.
+        cancel_event = threading.Event()
+        out_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def producer() -> None:
+            try:
+                for chunk in app.state.runtime.iter_audio_chunks(
+                    inputs, request_id=request_id, cancel_event=cancel_event
+                ):
+                    pcm = _pcm16(chunk.audio)
+                    if pcm:
+                        loop.call_soon_threadsafe(out_queue.put_nowait, pcm)
+            # Swallow generation errors (client may have already received the
+            # partial audio stream); the finally below guarantees end-of-stream.
+            except Exception:  # noqa: BLE001
+                loop.call_soon_threadsafe(out_queue.put_nowait, None)
+            finally:
+                # Sentinel: signals end of stream to the async consumer.
+                loop.call_soon_threadsafe(out_queue.put_nowait, None)
+
         try:
-            for chunk in app.state.runtime.iter_audio_chunks(
-                inputs, request_id=request_id
-            ):
-                pcm = _pcm16(chunk.audio)
-                if pcm:
-                    yield pcm
+            async with _gpu_lock:
+                thread = threading.Thread(target=producer, daemon=True)
+                thread.start()
+                try:
+                    while True:
+                        try:
+                            pcm = await asyncio.wait_for(out_queue.get(), timeout=0.5)
+                        except TimeoutError:
+                            # No chunk yet; loop back so client disconnects are
+                            # noticed promptly (Starlette closes this async
+                            # generator on disconnect, raising GeneratorExit).
+                            continue
+                        if pcm is None:
+                            break
+                        yield pcm
+                finally:
+                    # Fires both on normal completion and on client disconnect
+                    # (Starlette aclose()s the generator), releasing the GPU
+                    # slot promptly for the next queued request.
+                    cancel_event.set()
+                    thread.join(timeout=2)
         finally:
             if reference_path is not None:
                 reference_path.unlink(missing_ok=True)
-            _request_lock.release()
 
     return StreamingResponse(
         body(),
@@ -234,6 +273,12 @@ def main() -> None:
     parser.add_argument(
         "--fast-codec", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--compile-xpu",
+        action="store_true",
+        help="Use torch.compile for the backbone decode on XPU (CUDA uses "
+        "graph capture instead; ignored otherwise)",
+    )
     args = parser.parse_args()
 
     global _settings
@@ -245,6 +290,7 @@ def main() -> None:
         fast_backbone_decode=args.fast_backbone_decode,
         fast_depth_decoder=args.fast_depth_decoder,
         fast_codec=args.fast_codec,
+        compile_xpu=args.compile_xpu,
     )
 
     import uvicorn

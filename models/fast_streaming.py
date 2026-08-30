@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -42,6 +43,7 @@ class FastStreamingConfig:
     fast_backbone_decode: bool = False
     fast_depth_decoder: bool = False
     fast_codec: bool = False
+    compile_xpu: bool = False
     temperature: float | None = None
     top_k: int | None = None
     top_p: float | None = None
@@ -178,6 +180,7 @@ class FastBreezeStreamingRuntime:
         self._codec_chunk_frames = 1 if self._fast_codec else 2
         self.device = _get_device(model)
         self.dtype = _get_dtype(model)
+        self._compile_xpu = self.config.compile_xpu and self.device.type == "xpu"
         self._backbone_graph: BackboneGraph | None = None
         self._backbone_graphs: dict[int, BackboneGraph] = {}
         self._backbone_prefill_graph: BackbonePrefillGraphCache | None = None
@@ -193,12 +196,18 @@ class FastBreezeStreamingRuntime:
         )
 
         if self.device.type != "cuda":
-            _log.warning(
-                "fast streaming requires a CUDA device, but detected %s; disabling all fast "
-                "stages (graph capture / torch.compile are CUDA-only) and falling back to eager "
-                "inference",
-                self.device.type,
-            )
+            if self.device.type == "xpu" and self._compile_xpu:
+                _log.info(
+                    "XPU detected with compile_xpu enabled; disabling CUDA-graph "
+                    "stages (unavailable on XPU) but enabling torch.compile decode"
+                )
+            else:
+                _log.warning(
+                    "fast streaming requires a CUDA device, but detected %s; disabling all fast "
+                    "stages (graph capture / torch.compile are CUDA-only) and falling back to eager "
+                    "inference",
+                    self.device.type,
+                )
             self._fast_text_encoder = False
             self._fast_backbone_prefill = False
             self._fast_backbone_decode = False
@@ -256,6 +265,7 @@ class FastBreezeStreamingRuntime:
                 max_seq_len=self.config.max_seq_len,
                 guidance_scale=guidance_scale,
                 batch_size=branch_batch_size,
+                compile=self._compile_xpu,
             )
             if self._fast_backbone_decode:
                 backbone_graph.capture()
@@ -759,6 +769,7 @@ class FastBreezeStreamingRuntime:
         inputs: dict[str, Any],
         *,
         request_id: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> Iterator[FastStreamingChunk]:
         cfg = select_fast_cfg(inputs)
         branch_batch_size = 2 if cfg.mode == "single_cfg" else 1
@@ -847,6 +858,9 @@ class FastBreezeStreamingRuntime:
                     break
 
                 if prefill_len + step_idx >= self.config.max_seq_len - 1:
+                    break
+
+                if cancel_event is not None and cancel_event.is_set():
                     break
 
                 if branch.branch_batch_size == 2:
