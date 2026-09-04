@@ -45,6 +45,7 @@ class ApiSettings:
     fast_depth_decoder: bool
     fast_codec: bool
     compile_xpu: bool
+    device: str | None = None
 
 
 _settings: ApiSettings | None = None
@@ -80,7 +81,7 @@ async def _save_upload(upload: UploadFile) -> Path:
 def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     tokenizer, model, audio_tokenizer = load_runtime(
         settings.model,
-        device=resolve_device(),
+        device=resolve_device(settings.device),
         attn_implementation="eager",
     )
     update_generation_config_for_breeze(model)
@@ -279,6 +280,12 @@ def main() -> None:
         help="Use torch.compile for the backbone decode on XPU (CUDA uses "
         "graph capture instead; ignored otherwise)",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to run on (e.g. xpu:2, cuda:0, cpu). Defaults to auto-resolution.",
+    )
     args = parser.parse_args()
 
     global _settings
@@ -291,6 +298,7 @@ def main() -> None:
         fast_depth_decoder=args.fast_depth_decoder,
         fast_codec=args.fast_codec,
         compile_xpu=args.compile_xpu,
+        device=args.device,
     )
 
     import uvicorn
